@@ -1,0 +1,822 @@
+const HotAxleModel = require("../models/hotAxle.model");
+const supabaseAdmin = require("../config/supabaseAdmin");
+const rbac = require("../utils/rbac");
+const sOld = require('../config/supabaseOld');
+const { broadcastPushNotification } = require("../utils/notificationService");
+
+async function getRailwayTechnicalIds() {
+    const deviceMapping = {
+        'SCBB NP001': 'NP001',
+        'SCBB NP002': 'NP002',
+        'SCBB NP003': 'NP003',
+        'Raspberry4_4': '231035',
+        'Raspberry4_1': '231545',
+        'Raspberry4_2': '234534',
+        'Raspberry4_3': '211245'
+    };
+    const railwayMeta = { ...deviceMapping };
+    if (sOld) {
+        try {
+            const { data: regs } = await sOld
+                .from('coaches_railway')
+                .select('technical_id, device_id');
+            for (const reg of (regs || [])) {
+                if (reg.device_id) {
+                    railwayMeta[reg.device_id] = reg.technical_id;
+                }
+            }
+        } catch (e) {
+            console.error("Error fetching coaches_railway:", e.message);
+        }
+    }
+    return railwayMeta;
+}
+
+function enrichBatteryFields(item) {
+    const pct = item.battery_percentage != null ? parseInt(item.battery_percentage) : 50;
+    let batStatus = 'Moderate';
+    if (pct <= 20) batStatus = 'Low';
+    else if (pct >= 80) batStatus = 'High';
+    const batVoltage = parseFloat((3.0 + (pct / 100.0) * 1.2).toFixed(2));
+    return {
+        ...item,
+        battery_percentage: pct,
+        battery_status: batStatus,
+        battery_voltage: batVoltage,
+    };
+}
+
+const hotAxleController = {
+    receiveData: async (req, res) => {
+        try {
+            const payload = req.body;
+
+            if (req.query.confirmationToken) {
+                console.log("AWS Confirmation Handshake Received for Hot Axle");
+                return res.status(200).send("OK");
+            }
+
+            if (!payload || Object.keys(payload).length === 0) {
+                return res.status(400).json({ success: false, message: "Empty payload received" });
+            }
+
+            if (payload.timestamp) {
+                payload.timestamp = payload.timestamp.replace('T', ' ').replace(/\..*Z/, '');
+            }
+
+            let status = 'Good';
+            const tempKeys = Object.keys(payload).filter(key => key.includes('_temp'));
+            
+            for (let key of tempKeys) {
+                const tempValue = parseFloat(payload[key]);
+                if (tempValue >= 80) {
+                    status = 'Critical';
+                    break; 
+                } else if (tempValue >= 60) {
+                    status = 'Warning';
+                }
+            }
+
+            const dataToSave = { 
+                ...payload, 
+                train_no: payload.train_no || payload.train_number || payload.trainNo || null,
+                coach_no: payload.coach_no || payload.coach_number || payload.coachNo || null,
+                alert_status: status 
+            };
+
+            const insertId = await HotAxleModel.saveDynamicLog(dataToSave);
+
+            if (status !== 'Good') {
+                const coachNo = dataToSave.coach_no || 'Unknown coach';
+                const trainNo = dataToSave.train_no || 'Unknown train';
+                const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+                const isCritical = status === 'Critical';
+                const faultName = isCritical ? 'Critical Hot Axle' : `Hot Axle (${status})`;
+                const alertTitle = `Alert: ${faultName} in Train ${trainNo}, Coach_Unique Id ${coachNo} | ${nowStr}`;
+                await broadcastPushNotification(
+                    alertTitle,
+                    alertTitle,
+                    'HOT_AXLE',
+                    {
+                        module: 'hot_axle_section2',
+                        coach_no: coachNo,
+                        train_no: trainNo,
+                        status,
+                        fault_name: faultName,
+                        severity: isCritical ? 'critical' : 'warning',
+                        send_sms: isCritical, // SMS ONLY for Critical temperature warning
+                        location: payload.location || payload.train_location || payload.locName || payload.division,
+                    }
+                );
+            }
+
+            return res.status(201).json({ 
+                success: true, 
+                message: "Hot Axle data stored successfully", 
+                id: insertId,
+                calculated_status: status
+            });
+
+        } catch (error) {
+            console.error("Critical: HotAxle Controller Error ->", error.message);
+            res.status(500).json({ 
+                success: false, 
+                error: error.message 
+            });
+        }
+    },
+
+    // 2. GET API: Fetch stored device data from SQL
+    getHotAxleData: async (req, res) => {
+        try {
+            const filterDeviceId = req.query.deviceId || null;
+            const historyLimit = parseInt(req.query.limit) || 10;
+            let authorizedCoaches = await rbac.getAuthorizedCoachNumbers(req.user);
+
+            if (!rbac.isModuleLocationOwner(req.user, 'hot_axle_section2')) {
+                return res.status(200).json({
+                    success: true,
+                    count: 0,
+                    deviceId: filterDeviceId || "All Devices",
+                    data: []
+                });
+            }
+
+            if (rbac.isModuleLocationOwner(req.user, 'hot_axle_section2') && (!authorizedCoaches || authorizedCoaches.length === 0)) {
+                authorizedCoaches = null;
+            }
+
+            const readings = await HotAxleModel.getData(filterDeviceId, historyLimit, authorizedCoaches);
+
+            if (!readings || readings.length === 0) {
+                return res.status(200).json({
+                    success: true,
+                    count: 0,
+                    deviceId: filterDeviceId || "All Devices",
+                    data: []
+                });
+            }
+
+            const enriched = readings.map(enrichBatteryFields);
+
+            return res.status(200).json({
+                success: true,
+                count: enriched.length,
+                deviceId: filterDeviceId || "All Devices",
+                data: enriched
+            });
+
+        } catch (error) {
+            console.error("HotAxle GET Controller Error ->", error.message);
+            res.status(500).json({
+                success: false,
+                error: error.message
+            });
+        }
+    },
+
+        getHistory: async (req, res) => {
+    try {
+        const { 
+            deviceId, 
+            axleNumber,
+            coachNumber, 
+            coachType,
+            coachDeviceId,
+            startDate, 
+            endDate, 
+            page = 1, 
+            limit = 10000 
+        } = req.query;
+
+        const isHams = (coachType && coachType.toLowerCase() === 'hams') ||
+                       (coachNumber && (coachNumber.startsWith('Master:') || coachNumber === '226965')) ||
+                       (coachDeviceId && (coachDeviceId.toLowerCase().includes('hams') || coachDeviceId.includes('SCBB-NP-26-003'))) ||
+                       (deviceId && (deviceId.toLowerCase().startsWith('hams') || /^a[1-4][1-2]$/i.test(deviceId)));
+
+        if (isHams && !rbac.isModuleLocationOwner(req.user, 'hot_axle_section1')) {
+            return res.status(200).json({
+                success: true,
+                meta: { totalRecords: 0, currentPage: parseInt(page), totalPages: 0, limit: parseInt(limit) },
+                data: []
+            });
+        }
+
+        if (!isHams && !rbac.isModuleLocationOwner(req.user, 'hot_axle_section2')) {
+            return res.status(200).json({
+                success: true,
+                meta: { totalRecords: 0, currentPage: parseInt(page), totalPages: 0, limit: parseInt(limit) },
+                data: []
+            });
+        }
+
+        if (isHams) {
+            const sOld = require('../config/supabaseOld');
+            if (!sOld) {
+                return res.status(500).json({ success: false, message: "Old Supabase not configured" });
+            }
+
+            // Fetch HAMS registration metadata from coaches_hams - match by actual_id
+            // coaches_hams schema: id, technical_id, coach_no, device_id, train_no, location, actual_id
+            // device_id here = brake binding device (SCBB-NP-003)
+            // coach_no = coach number shown as Technical ID (B1)
+            const { data: hamsRegs } = await supabaseAdmin
+                .from('coaches_hams')
+                .select('coach_no, train_no, technical_id, location, actual_id, device_id');
+
+            // Build lookup maps by actual_id and technical_id (lowercased)
+            const hamsMetaMap = {};
+            const hamsMetaMapByTechId = {};
+            for (const reg of (hamsRegs || [])) {
+                const k = (reg.actual_id || '').trim().toLowerCase();
+                if (k) hamsMetaMap[k] = reg;
+                const t = (reg.technical_id || '').trim().toLowerCase();
+                if (t) hamsMetaMapByTechId[t] = reg;
+            }
+
+            const hamsReg = hamsMetaMap['hams-m1-001'] || (hamsRegs && hamsRegs[0]) || null;
+            const dbMasterId = 'HAMS-M1-001';
+            const isHamsM1 = true;
+
+            const coachTypeFromDB = 'LWSCZ - AC';
+
+            let query = sOld.from('hams_data')
+                .select('*')
+                .eq('master_id', dbMasterId);
+
+            // Filter by specific sensor device if provided
+            if (deviceId && deviceId !== 'All') {
+                query = query.eq('device_id', deviceId);
+            }
+
+            if (startDate && endDate) {
+                query = query
+                    .gte('created_at', `${startDate}T00:00:00`)
+                    .lte('created_at', `${endDate}T23:59:59`);
+            }
+
+            let { data, error } = await query
+                .order('created_at', { ascending: false })
+                .limit(10000);
+
+            if ((!data || data.length === 0) && startDate && endDate) {
+                let fbQuery = sOld.from('hams_data')
+                    .select('*')
+                    .eq('master_id', dbMasterId);
+                if (deviceId && deviceId !== 'All') {
+                    fbQuery = fbQuery.eq('device_id', deviceId);
+                }
+                const fbRes = await fbQuery
+                    .order('created_at', { ascending: false })
+                    .limit(10000);
+                if (fbRes.data && fbRes.data.length > 0) {
+                    data = fbRes.data;
+                }
+            }
+
+            // Field mapping:
+            // coach_no  → shown as coach number (technical_id from registration)
+            // device_id → shown as device_id (SCBB-NP-26-003, the brake binding device)
+            // train_no  → from DB
+            const coachNo = isHamsM1 ? '226965' : (hamsReg?.technical_id || '');
+            const trainNo = isHamsM1 ? '1207069' : (hamsReg?.train_no || '');
+            const technicalId = coachNo;
+            const brakeDeviceId = isHamsM1 ? 'SCBB-NP-26-003' : (hamsReg?.device_id || '');
+            const location = hamsReg?.location || 'N/A';
+            const coachType = coachTypeFromDB;
+
+            if (error) throw error;
+
+            const grouped = {};
+            for (let d of (data || [])) {
+                const ts = d.created_at || d.timestamp || d.received_timestamp;
+                if (!ts) continue;
+                const dateObj = new Date(ts);
+                if (isNaN(dateObj.getTime())) continue;
+                const min = dateObj.getMinutes();
+                const roundedMin = min - (min % 15);
+                dateObj.setMinutes(roundedMin, 0, 0);
+                const bucket = dateObj.toISOString();
+                if (!grouped[bucket]) grouped[bucket] = [];
+                grouped[bucket].push(d);
+            }
+
+            const hamsOrder = ['HAMS001', 'HAMS002', 'HAMS003', 'HAMS004', 'HAMS005', 'HAMS006', 'HAMS008', 'HAMS009'];
+            let mappedHistory = [];
+            
+            // Build axle-specific device lookup map
+            const axleDevices = {};
+            for (const r of (hamsRegs || [])) {
+                if (r.actual_id) {
+                    axleDevices[r.actual_id.toLowerCase()] = r.device_id || '';
+                }
+            }
+            const sensorToActualId = {
+                'A11': 'axel_1a', 'A12': 'axel_1b',
+                'A21': 'axel_2a', 'A22': 'axel_2b',
+                'A31': 'axel_3a', 'A32': 'axel_3b',
+                'A41': 'axel_4a', 'A42': 'axel_4b'
+            };
+
+            if (deviceId && deviceId !== 'All') {
+                for (let bucket in grouped) {
+                    const devices = grouped[bucket];
+                    const match = devices.find(d => d.device_id === deviceId);
+                    if (!match) continue; // Skip to prevent repeating timing/data issue when sensor was not active
+
+                    const temp = match.temperature || 0;
+                    let bat = 50;
+                    if (match.battery_status) {
+                        const bs = match.battery_status.toLowerCase();
+                        if (bs === 'low') bat = 15;
+                        else if (bs === 'moderate') bat = 40;
+                        else if (bs === 'high') bat = 80;
+                    }
+
+                    let temps = [0,0,0,0,0,0,0,0];
+                    let devIdx = hamsOrder.indexOf(deviceId);
+                    if (devIdx === -1) {
+                        const num = parseInt(deviceId.replace(/\D/g, ''));
+                        if (!isNaN(num)) {
+                            if (num <= 6) devIdx = num - 1;
+                            else if (num >= 8 && num <= 9) devIdx = num - 2;
+                        }
+                    }
+                    if (devIdx >= 0 && devIdx < 8) {
+                        temps[devIdx] = temp;
+                    } else {
+                        temps[0] = temp;
+                    }
+
+                    let actualAxleDeviceId = deviceId;
+                    if (deviceId.startsWith('A')) {
+                        const actual = sensorToActualId[deviceId.toUpperCase()];
+                        if (actual && axleDevices[actual]) {
+                            actualAxleDeviceId = axleDevices[actual];
+                        }
+                    }
+
+                    const rawBatStatus = match.battery_status || '';
+                    const rawBatVoltage = match.battery_voltage != null ? parseFloat(match.battery_voltage) : 0.0;
+                    const batVoltage = rawBatVoltage > 0 ? rawBatVoltage : parseFloat((3.0 + (bat / 100.0) * 1.2).toFixed(2));
+
+                    mappedHistory.push({
+                        timestamp: bucket,
+                        device_id: actualAxleDeviceId,
+                        master_id: dbMasterId,
+                        coach_number: coachNo,
+                        train_no: trainNo,
+                        technical_id: technicalId,
+                        brake_device_id: brakeDeviceId,
+                        coach_type: coachType,
+                        owning_rly: 'VASP',
+                        location: location,
+                        a11_temp: temps[0], a12_temp: temps[1],
+                        a21_temp: temps[2], a22_temp: temps[3],
+                        a31_temp: temps[4], a32_temp: temps[5],
+                        a41_temp: temps[6], a42_temp: temps[7],
+                        battery_percentage: bat,
+                        battery_status: rawBatStatus || (bat <= 20 ? 'Low' : (bat >= 80 ? 'High' : 'Moderate')),
+                        battery_voltage: batVoltage,
+                        signal_strength: 0,
+                        alert_status: temp > 60 ? 'Warning' : 'Good',
+                    });
+                }
+            } else {
+                for (let bucket in grouped) {
+                    const devices = grouped[bucket];
+                    const axleDevices = [...devices].filter(d => d.device_id !== 'HAMS007');
+
+                    let temps = [0,0,0,0,0,0,0,0];
+                    let maxTemp = 0;
+                    for (let dev of axleDevices) {
+                        let idx = hamsOrder.indexOf(dev.device_id);
+                        if (idx === -1) {
+                            const num = parseInt(dev.device_id.replace(/\D/g, ''));
+                            if (!isNaN(num)) {
+                                if (num <= 6) idx = num - 1;
+                                else if (num >= 8 && num <= 9) idx = num - 2;
+                            }
+                        }
+                        if (idx >= 0 && idx < 8) {
+                            temps[idx] = dev.temperature || 0;
+                            if (temps[idx] > maxTemp) maxTemp = temps[idx];
+                        }
+                    }
+
+                    let bat = 50;
+                    if (axleDevices[0] && axleDevices[0].battery_status) {
+                        const bs = axleDevices[0].battery_status.toLowerCase();
+                        if (bs === 'low') bat = 15;
+                        else if (bs === 'moderate') bat = 40;
+                        else if (bs === 'high') bat = 80;
+                    }
+
+                    const rawBatStatus2 = (axleDevices[0] && axleDevices[0].battery_status) || '';
+                    const rawBatVoltage2 = (axleDevices[0] && axleDevices[0].battery_voltage) != null ? parseFloat(axleDevices[0].battery_voltage) : 0.0;
+                    const batVoltage2 = rawBatVoltage2 > 0 ? rawBatVoltage2 : parseFloat((3.0 + (bat / 100.0) * 1.2).toFixed(2));
+
+                    mappedHistory.push({
+                        timestamp: bucket,
+                        device_id: brakeDeviceId || coachNo || dbMasterId,
+                        master_id: dbMasterId,
+                        coach_number: coachNo,
+                        train_no: trainNo,
+                        technical_id: technicalId,
+                        brake_device_id: brakeDeviceId,
+                        coach_type: coachType,
+                        owning_rly: 'VASP',
+                        location: location,
+                        a11_temp: temps[0], a12_temp: temps[1],
+                        a21_temp: temps[2], a22_temp: temps[3],
+                        a31_temp: temps[4], a32_temp: temps[5],
+                        a41_temp: temps[6], a42_temp: temps[7],
+                        battery_percentage: bat,
+                        battery_status: rawBatStatus2 || (bat <= 20 ? 'Low' : (bat >= 80 ? 'High' : 'Moderate')),
+                        battery_voltage: batVoltage2,
+                        signal_strength: 0,
+                        alert_status: maxTemp > 60 ? 'Warning' : 'Good',
+                    });
+                }
+            }
+
+            if (axleNumber && axleNumber !== 'All' && !isNaN(parseInt(axleNumber))) {
+                const aIdx = parseInt(axleNumber) - 1;
+                const axleCols = ['a11_temp', 'a12_temp', 'a21_temp', 'a22_temp', 'a31_temp', 'a32_temp', 'a41_temp', 'a42_temp'];
+                mappedHistory = mappedHistory.map(item => {
+                    const isolated = [0, 0, 0, 0, 0, 0, 0, 0];
+                    if (aIdx >= 0 && aIdx < 8) {
+                        isolated[aIdx] = item[axleCols[aIdx]] || 0;
+                    }
+                    return {
+                        ...item,
+                        a11_temp: isolated[0], a12_temp: isolated[1],
+                        a21_temp: isolated[2], a22_temp: isolated[3],
+                        a31_temp: isolated[4], a32_temp: isolated[5],
+                        a41_temp: isolated[6], a42_temp: isolated[7]
+                    };
+                });
+            }
+
+            mappedHistory.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+
+            const total = mappedHistory.length;
+            const startIdx = (parseInt(page) - 1) * parseInt(limit);
+            const paged = mappedHistory.slice(startIdx, startIdx + parseInt(limit));
+
+            return res.status(200).json({
+                success: true,
+                meta: {
+                    totalRecords: total,
+                    currentPage: parseInt(page),
+                    totalPages: Math.ceil(total / parseInt(limit)),
+                    limit: parseInt(limit)
+                },
+                data: paged
+            });
+        }
+
+        const offset = (parseInt(page) - 1) * parseInt(limit);
+        let authorizedCoaches = await rbac.getAuthorizedCoachNumbers(req.user);
+        if (rbac.isModuleLocationOwner(req.user, 'hot_axle_section2') && (!authorizedCoaches || authorizedCoaches.length === 0)) {
+            authorizedCoaches = null;
+        }
+
+        const result = await HotAxleModel.getHistoryData({
+            deviceId: deviceId || 'All',
+            coachNumber: coachNumber || 'All',
+            startDate: startDate || null,
+            endDate: endDate || null,
+            limit: 10000,
+            offset: 0,
+            authorizedCoaches
+        });
+
+        const technicalIdsMap = await getRailwayTechnicalIds();
+        let rawItems = (result.data || []).map(item => enrichBatteryFields({
+            ...item,
+            technical_id: technicalIdsMap[item.device_id] || ''
+        }));
+
+        // In-memory date filter (DB may not have a reliable timestamp column)
+        if (startDate && endDate) {
+            const startDt = new Date(`${startDate}T00:00:00`);
+            const endDt = new Date(`${endDate}T23:59:59`);
+            const filtered = rawItems.filter(d => {
+                const ts = d.created_at || d.timestamp || d.received_timestamp;
+                if (!ts) return true;
+                const dt = new Date(ts);
+                return isNaN(dt.getTime()) || (dt >= startDt && dt <= endDt);
+            });
+            if (filtered.length > 0) {
+                rawItems = filtered;
+            }
+        }
+
+        const axleColumns = ['a11_temp','a12_temp','a21_temp','a22_temp','a31_temp','a32_temp','a41_temp','a42_temp'];
+
+        if (axleNumber && !isNaN(parseInt(axleNumber))) {
+            const aIdx = parseInt(axleNumber) - 1;
+            const col = axleColumns[aIdx] || 'a11_temp';
+            const filtered = rawItems.map(d => {
+                const val = d[col] || 0;
+                const temps = [0,0,0,0,0,0,0,0];
+                temps[aIdx] = val;
+                return { ...d,
+                    a11_temp: temps[0], a12_temp: temps[1],
+                    a21_temp: temps[2], a22_temp: temps[3],
+                    a31_temp: temps[4], a32_temp: temps[5],
+                    a41_temp: temps[6], a42_temp: temps[7],
+                };
+            });
+            const bucketed = {};
+            for (let d of filtered) {
+                const ts = d.created_at || d.timestamp;
+                if (!ts) continue;
+                const dateObj = new Date(ts);
+                if (isNaN(dateObj.getTime())) continue;
+                const min = dateObj.getMinutes();
+                const roundedMin = min - (min % 15);
+                dateObj.setMinutes(roundedMin, 0, 0);
+                const bucket = dateObj.toISOString();
+                if (!bucketed[bucket] || new Date(ts) > new Date(bucketed[bucket].created_at || bucketed[bucket].timestamp)) {
+                    bucketed[bucket] = d;
+                }
+            }
+            let paged2 = Object.values(bucketed);
+            paged2.sort((a, b) => ((b.created_at || b.timestamp) || '').localeCompare((a.created_at || a.timestamp) || ''));
+            const total2 = paged2.length;
+            const startIdx2 = (parseInt(page) - 1) * parseInt(limit);
+            const slice2 = paged2.slice(startIdx2, startIdx2 + parseInt(limit));
+            return res.status(200).json({
+                success: true,
+                meta: {
+                    totalRecords: total2,
+                    currentPage: parseInt(page),
+                    totalPages: Math.ceil(total2 / parseInt(limit)),
+                    limit: parseInt(limit)
+                },
+                data: slice2
+            });
+        }
+
+        const grouped = {};
+        for (let d of rawItems) {
+            const ts = d.created_at || d.timestamp;
+            if (!ts) continue;
+            const dateObj = new Date(ts);
+            if (isNaN(dateObj.getTime())) continue;
+            const min = dateObj.getMinutes();
+            const roundedMin = min - (min % 15);
+            dateObj.setMinutes(roundedMin, 0, 0);
+            const bucket = dateObj.toISOString();
+            if (!grouped[bucket] || new Date(ts) > new Date(grouped[bucket].created_at || grouped[bucket].timestamp)) {
+                grouped[bucket] = d;
+            }
+        }
+
+        let bucketed = Object.values(grouped);
+        // Fallback to raw data if no records had timestamps for bucketing
+        if (bucketed.length === 0) {
+            bucketed = rawItems.slice(0, parseInt(limit));
+        } else {
+            bucketed.sort((a, b) => ((b.created_at || b.timestamp) || '').localeCompare((a.created_at || a.timestamp) || ''));
+        }
+
+        const total = bucketed.length;
+        const startIdx = (parseInt(page) - 1) * parseInt(limit);
+        const paged = bucketed.slice(startIdx, startIdx + parseInt(limit));
+
+        return res.status(200).json({
+            success: true,
+            meta: {
+                totalRecords: total,
+                currentPage: parseInt(page),
+                totalPages: Math.ceil(total / parseInt(limit)),
+                limit: parseInt(limit)
+            },
+            data: paged
+        });
+
+    } catch (error) {
+        console.error("History Controller Error ->", error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+},
+
+    getFilterOptions: async (req, res) => {
+        try {
+            if (!rbac.isModuleLocationOwner(req.user, 'hot_axle_section2')) {
+                return res.status(200).json({
+                    success: true,
+                    data: { deviceIds: [], coachTypes: [], owningRlys: [], trainNos: [], coachNumbers: [] }
+                });
+            }
+
+            const options = await HotAxleModel.getFilterOptions();
+            return res.status(200).json({ success: true, data: options });
+        } catch (error) {
+            console.error("Filter Options Controller Error ->", error.message);
+            res.status(500).json({ success: false, error: error.message });
+        }
+    },
+
+    getDashboardStatus: async (req, res) => {
+        try {
+            const { trainNo, deviceId, coachType, owningRly, coachNumber } = req.query;
+            let authorizedCoaches = await rbac.getAuthorizedCoachNumbers(req.user);
+
+            if (!rbac.isModuleLocationOwner(req.user, 'hot_axle_section2')) {
+                return res.status(200).json({
+                    success: true,
+                    totalCoaches: 0,
+                    data: []
+                });
+            }
+
+            if (rbac.isModuleLocationOwner(req.user, 'hot_axle_section2') && (!authorizedCoaches || authorizedCoaches.length === 0)) {
+                authorizedCoaches = null;
+            }
+
+            const statusData = await HotAxleModel.getLatestStatusForAllCoaches({
+                trainNo, deviceId, coachType, owningRly, coachNumber
+            }, authorizedCoaches);
+
+            const technicalIdsMap = await getRailwayTechnicalIds();
+            const enriched = (statusData || []).map(item => enrichBatteryFields({
+                ...item,
+                technical_id: technicalIdsMap[item.device_id] || ''
+            }));
+
+            return res.status(200).json({
+                success: true,
+                totalCoaches: enriched.length,
+                data: enriched
+            });
+
+        } catch (error) {
+            console.error("Dashboard Controller Error ->", error.message);
+            res.status(500).json({ success: false, error: error.message });
+        }
+    },
+
+    getNewCompanyData: async (req, res) => {
+        try {
+            const hasSection1 = rbac.isModuleLocationOwner(req.user, 'hot_axle_section1');
+            const hasSection2 = rbac.isModuleLocationOwner(req.user, 'hot_axle_section2');
+
+            if (hasSection1) {
+                const supabaseOld = require('../config/supabaseOld');
+                if (!supabaseOld) {
+                    return res.status(500).json({ success: false, message: "Old Supabase not configured" });
+                }
+
+                // Use coaches_hams as the registration source for Section 1 HAMS devices
+                const { data: hamsRegs } = await supabaseAdmin
+                    .from('coaches_hams')
+                    .select('coach_no, train_no, technical_id, location, actual_id, device_id');
+
+                // Fetch coach types from coaches_railway
+                const { data: railRegs } = await supabaseAdmin
+                    .from('coaches_railway')
+                    .select('device_id, coach_type');
+                
+                const railCoachTypeMap = {};
+                for (const r of (railRegs || [])) {
+                    if (r.device_id && r.coach_type) {
+                        railCoachTypeMap[r.device_id] = r.coach_type;
+                    }
+                }
+
+                // Build a lookup for coach-level meta (use first valid entry as master fallback for now)
+                // Also build an axle-level device ID map: actual_id -> device_id
+                const hamsMeta = {};
+                const axleDevices = {};
+                for (const reg of (hamsRegs || [])) {
+                    const key = (reg.actual_id || '').trim();
+                    if (key) {
+                        const isHamsM1 = key.toLowerCase() === 'hams-m1-001';
+                        axleDevices[key.toLowerCase()] = reg.device_id || '';
+                        hamsMeta[key] = {
+                            coach_no: reg.coach_no || '',
+                            train_no: isHamsM1 ? '1207069' : (reg.train_no || ''),
+                            technical_id: isHamsM1 ? '226965' : (reg.technical_id || ''),
+                            location: reg.location || 'N/A',
+                            device_id: isHamsM1 ? 'SCBB-NP-26-003' : (reg.device_id || ''),
+                            coach_type: isHamsM1 ? 'LWSCZ - AC' : (railCoachTypeMap[reg.device_id] || 'B1'),
+                        };
+                    }
+                }
+
+                const masterId = 'HAMS-M1-001';
+                const hamsM1Meta = hamsMeta[masterId] || (hamsRegs && hamsRegs.length > 0 ? hamsMeta[hamsRegs[0].actual_id] : null) || {};
+
+                const hamsDeviceIds = ['HAMS001', 'HAMS002', 'HAMS003', 'HAMS004', 'HAMS005', 'HAMS006', 'HAMS008', 'HAMS009'];
+                const latestRows = [];
+                for (const devId of hamsDeviceIds) {
+                    let { data, error } = await supabaseOld
+                        .from('hams_data')
+                        .select('*')
+                        .eq('device_id', devId)
+                        .eq('master_id', masterId)
+                        .gt('temperature', 0)
+                        .order('created_at', { ascending: false })
+                        .limit(1);
+                    if (error) continue;
+                    if (!data || data.length === 0) {
+                        const fallback = await supabaseOld
+                            .from('hams_data')
+                            .select('*')
+                            .eq('device_id', devId)
+                            .eq('master_id', masterId)
+                            .order('created_at', { ascending: false })
+                            .limit(1);
+                        if (fallback.error) continue;
+                        data = fallback.data;
+                    }
+                    if (data && data.length > 0) latestRows.push(data[0]);
+                }
+
+                const enriched = latestRows.map(d => ({
+                    ...d,
+                    device_id: d.device_id || '',
+                    master_id: masterId,
+                    coach_number: hamsM1Meta.technical_id || '226965',
+                    train_no: hamsM1Meta.train_no || '1207069',
+                    coach_type: hamsM1Meta.coach_type || 'LWSCZ - AC',
+                    brake_device_id: hamsM1Meta.device_id || 'SCBB-NP-26-003',
+                    location: hamsM1Meta.location || 'N/A',
+                    technical_id: hamsM1Meta.technical_id || '',
+                    axle_devices: axleDevices,
+                }));
+
+                return res.status(200).json({
+                    success: true,
+                    totalCoaches: enriched.length,
+                    data: enriched,
+                });
+            } else if (hasSection2) {
+                let authorizedCoaches = await rbac.getAuthorizedCoachNumbers(req.user);
+                let query = supabaseAdmin
+                    .from('hot_axle_logs')
+                    .select('*')
+                    .order('id', { ascending: false })
+                    .limit(500);
+
+                if (authorizedCoaches && authorizedCoaches.length > 0) {
+                    query = query.in('coach_number', authorizedCoaches);
+                }
+
+                const { data, error } = await query;
+
+                if (error) throw error;
+
+                const mapped = (data || []).map(item => {
+                    const temps = [item.a11_temp, item.a12_temp, item.a21_temp, item.a22_temp,
+                                   item.a31_temp, item.a32_temp, item.a41_temp, item.a42_temp]
+                                   .filter(t => t != null && t >= 0);
+                    const maxTemp = temps.length > 0 ? Math.max(...temps) : 0;
+                    const pct = item.battery_percentage != null ? parseInt(item.battery_percentage) : 50;
+                    let batteryStatus = 'Moderate';
+                    if (pct <= 20) batteryStatus = 'Low';
+                    else if (pct >= 80) batteryStatus = 'High';
+                    const batVoltage = parseFloat((3.0 + (pct / 100.0) * 1.2).toFixed(2));
+                    return {
+                        id: item.id,
+                        device_id: item.device_id || '',
+                        master_id: item.coach_number || item.device_id || '',
+                        temperature: maxTemp,
+                        status: item.alert_status || 'Active',
+                        temp_state: maxTemp > 80 ? 'Critical' : (maxTemp > 60 ? 'Warning' : 'Normal'),
+                        received_timestamp: item.timestamp || item.created_at || '',
+                        battery_status: batteryStatus,
+                        battery_voltage: batVoltage,
+                        coach_number: item.coach_number || '',
+                        train_no: item.train_no || '',
+                        technical_id: item.tech_coach_no || '',
+                        coach_type: item.coach_type || '',
+                        location: item.owning_rly || '',
+                        brake_device_id: item.device_id || '',
+                    };
+                });
+
+                return res.status(200).json({
+                    success: true,
+                    totalCoaches: mapped.length,
+                    data: mapped
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                totalCoaches: 0,
+                data: [],
+            });
+        } catch (error) {
+            console.error("New Company Data Error:", error.message);
+            res.status(500).json({ success: false, error: error.message });
+        }
+    }
+};
+
+module.exports = hotAxleController;

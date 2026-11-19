@@ -1,0 +1,79 @@
+class FsdsBypassModel {
+  final int id;
+  final String assetId;
+  final String assetName;
+  final String timestamp;
+  final bool isBypassed;
+  final String sensorId;
+  final String locName;
+  final String locId;
+  final String trainNo;
+  final String coachNo;
+  final String deviceId;
+  final int fireStatus;
+  final int methaneLevel;
+
+  FsdsBypassModel({
+    this.id = 0,
+    required this.assetId,
+    required this.assetName,
+    required this.timestamp,
+    required this.isBypassed,
+    this.sensorId = '',
+    this.locName = '',
+    this.locId = '',
+    this.trainNo = '',
+    this.coachNo = '',
+    this.deviceId = '',
+    this.fireStatus = 0,
+    this.methaneLevel = 0,
+  });
+
+  bool get isRecent {
+    try {
+      return DateTime.now().difference(DateTime.parse(timestamp)).inMinutes < 60;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  String get statusText => isBypassed ? 'Bypassed' : 'Normal';
+  String get statusCode => isBypassed ? '1' : '0';
+
+  factory FsdsBypassModel.fromJson(Map<String, dynamic> json) {
+    final ts = _normalizeTimestamp(json['timestamp'] ?? '');
+
+    final fStatus = _parseInt(json['fire_status']);
+    final sLevel = _parseInt(json['methane_level']);
+
+    return FsdsBypassModel(
+      id: _parseInt(json['id']),
+      assetId: (json['asset_id'] ?? json['assetId'] ?? '').toString(),
+      assetName: (json['asset_name'] ?? json['assetName'] ?? '').toString(),
+      timestamp: ts,
+      isBypassed: fStatus == 1,
+      sensorId: (json['sensorId'] ?? '').toString(),
+      locName: (json['loc_name'] ?? json['locName'] ?? '').toString(),
+      locId: (json['loc_id'] ?? json['locId'] ?? '').toString(),
+      trainNo: (json['train_no'] ?? json['trainNo'] ?? '').toString(),
+      coachNo: (json['asset_name'] ?? json['coachNo'] ?? '').toString(),
+      deviceId: (json['device_id'] ?? json['deviceId'] ?? '').toString(),
+      fireStatus: fStatus,
+      methaneLevel: sLevel,
+    );
+  }
+
+  static int _parseInt(dynamic v) {
+    if (v == null) return 0;
+    if (v is int) return v;
+    if (v is double) return v.toInt();
+    if (v is String) return int.tryParse(v) ?? 0;
+    return 0;
+  }
+
+  static String _normalizeTimestamp(String ts) {
+    if (ts.isEmpty) return DateTime.now().toIso8601String();
+    if (ts.contains('T')) return ts;
+    return ts.replaceFirst(' ', 'T');
+  }
+}

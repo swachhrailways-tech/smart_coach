@@ -1,0 +1,105 @@
+const dieselModel = require('../models/diesel.model');
+const rbac = require('../utils/rbac');
+const { successResponse, errorResponse } = require('../utils/response');
+const { broadcastPushNotification } = require('../utils/notificationService');
+
+// Tracks last status per sensor to only push on a Good -> Warning/Critical change.
+const _dieselAlertState = {};
+
+exports.getDieselReadings = async (req, res) => {
+  try {
+    if (!rbac.isModuleAuthorized(req.user, 'diesel')) {
+      return successResponse(res, 'No diesel sensors found for this user location', [], 200);
+    }
+    const { coach_id } = req.query;
+    const authorizedCoaches = await rbac.getAuthorizedCoachNumbers(req.user);
+    const sensors = await dieselModel.getDieselSensors(coach_id, authorizedCoaches);
+
+    if (!sensors.length) {
+      return successResponse(res, 'No diesel sensors found for this coach', [], 200);
+    }
+
+    const sensorIds = sensors.map(s => s.sensor_id);
+    const readings = await dieselModel.getLatestReadings(sensorIds);
+
+    const result = sensors.map(sensor => {
+      const reading = readings.find(r => r.sensor_id === sensor.sensor_id);
+      const value = reading ? parseFloat(reading.value) : 0;
+      const timestamp = reading ? reading.timestamp : new Date().toISOString();
+      const percentage = Math.min(100, Math.max(0, Math.round(value)));
+
+      let status = 'Good';
+      if (percentage <= 25) status = 'Critical';
+      else if (percentage <= 50) status = 'Warning';
+
+      const prevStatus = _dieselAlertState[sensor.sensor_id];
+      const isAlert = status === 'Warning' || status === 'Critical';
+      if (isAlert && prevStatus !== status && prevStatus !== 'Warning' && prevStatus !== 'Critical') {
+        const coachNo = sensor.coach_id || 'Unknown';
+        const trainNo = sensor.train_number || 'Unknown';
+        const deviceId = sensor.sensor_id || 'Unknown';
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const formattedTime = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+        const alertText = `Alert: Diesel Level (${status}) in Train ${trainNo}, Coach_Unique Id ${coachNo} | ${formattedTime}`;
+        broadcastPushNotification(
+          alertText,
+          alertText,
+          'DIESEL',
+          { module: 'diesel', coach_no: coachNo, train_no: trainNo, percentage, status },
+          { location: sensor.location || sensor.division }
+        ).catch(() => {});
+      }
+      _dieselAlertState[sensor.sensor_id] = status;
+
+      return {
+        sensor_id: sensor.sensor_id,
+        coach_id: sensor.coach_id,
+        train_number: sensor.train_number,
+        train_name: sensor.train_name,
+        percentage,
+        status,
+        loco_number: `Loco #${sensor.coach_id}`,
+        capacity: 5000,
+        consumption_rate: 400,
+        estimated_run_time: +(percentage / 20).toFixed(1),
+        range_left: Math.round(percentage * 12),
+        last_updated: timestamp,
+      };
+    });
+
+    return successResponse(res, 'Diesel readings retrieved', result, 200);
+  } catch (err) {
+    console.error('Error fetching diesel readings:', err);
+    return errorResponse(res, 'Failed to fetch diesel readings', 500);
+  }
+};
+
+exports.getDieselHistory = async (req, res) => {
+  try {
+    const { sensor_id, fromDate, toDate } = req.query;
+    if (!sensor_id) {
+      return errorResponse(res, 'Missing sensor_id', 400);
+    }
+    if (!rbac.isModuleAuthorized(req.user, 'diesel')) {
+      return successResponse(res, 'Diesel history is not available for this user', [], 200);
+    }
+
+    const authorizedCoaches = await rbac.getAuthorizedCoachNumbers(req.user);
+    if (authorizedCoaches !== null) {
+      const sensors = await dieselModel.getDieselSensors(null, authorizedCoaches);
+      if (!sensors.some((sensor) => sensor.sensor_id === sensor_id)) {
+        return successResponse(res, 'Diesel history is not available for this user', [], 200);
+      }
+    }
+
+    const history = await dieselModel.getReadingHistory(sensor_id, {
+      fromDate: fromDate || null,
+      toDate: toDate || null,
+    });
+    return successResponse(res, 'Diesel reading history retrieved', history, 200);
+  } catch (err) {
+    console.error('Error fetching diesel history:', err);
+    return errorResponse(res, 'Failed to fetch diesel history', 500);
+  }
+};

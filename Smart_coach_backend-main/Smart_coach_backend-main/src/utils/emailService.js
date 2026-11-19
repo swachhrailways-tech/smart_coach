@@ -1,0 +1,259 @@
+const supabaseAdmin = require('../config/supabaseAdmin');
+
+const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
+
+const DEFAULT_ALERT_TYPES = 'BRAKE_BINDING,CR_OVERCHARGE,HOT_AXLE,ACP,ODOUR';
+
+// In-memory throttle state (resets on server restart, which is fine).
+const lastSentByKey = new Map();
+let sentToday = 0;
+let dayStamp = new Date().toISOString().slice(0, 10);
+
+function isConfigured() {
+  return !!(process.env.BREVO_API_KEY && process.env.BREVO_SENDER_EMAIL);
+}
+
+/**
+ * Email alerts are opt-in via env. When EMAIL_ALERTS_ENABLED is not 'false' and
+ * Brevo is configured, email alerts are on.
+ */
+function isEnabled() {
+  if (String(process.env.EMAIL_ALERTS_ENABLED || '').toLowerCase() === 'false') {
+    return false;
+  }
+  return isConfigured();
+}
+
+function allowedTypes() {
+  const raw = process.env.EMAIL_ALERT_TYPES || DEFAULT_ALERT_TYPES;
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean)
+  );
+}
+
+function cooldownMs() {
+  const parsed = parseInt(process.env.EMAIL_ALERT_COOLDOWN_MS || '', 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 15 * 60 * 1000;
+}
+
+function dailyLimit() {
+  const parsed = parseInt(process.env.EMAIL_DAILY_LIMIT || '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 250;
+}
+
+function rollDay() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== dayStamp) {
+    dayStamp = today;
+    sentToday = 0;
+    lastSentByKey.clear();
+  }
+}
+
+async function sendTransactionalEmail(to, subject, html, options = {}) {
+  if (!isConfigured()) throw new Error('Brevo email is not configured');
+
+  const senderName = process.env.BREVO_SENDER_NAME || 'Smart Coach';
+  const payload = {
+    sender: { name: senderName, email: process.env.BREVO_SENDER_EMAIL },
+    to: [{ email: to }],
+    subject,
+    htmlContent: html,
+  };
+
+  if (Array.isArray(options.attachments) && options.attachments.length > 0) {
+    payload.attachment = options.attachments.map((attachment) => ({
+      name: attachment.name,
+      content: Buffer.isBuffer(attachment.content)
+        ? attachment.content.toString('base64')
+        : String(attachment.content),
+    }));
+  }
+
+  const response = await fetch(BREVO_API_URL, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'api-key': process.env.BREVO_API_KEY,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`Brevo send failed (${response.status}): ${details}`);
+  }
+}
+
+const LOCATION_ALIASES = {
+  kolkatta: 'kolkata',
+  calcutta: 'kolkata',
+};
+
+function normalizeLocation(value) {
+  const raw = String(value == null ? '' : value).trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!raw) return '';
+  const key = raw.replace(/[^a-z0-9]/g, '');
+  return LOCATION_ALIASES[key] || raw;
+}
+
+function userMatchesLocation(user, location) {
+  // Unrestricted users (Admins, SuperAdmins, Testers) always receive alert emails
+  if (user.role_id === 1 || user.role_id === 2 || String(user.email || '').toLowerCase() === 'tester@example.com') {
+    return true;
+  }
+  const target = normalizeLocation(location);
+  // Fail closed: without a concrete alert location we cannot prove the user
+  // should see this data, so do not send a cross-location email.
+  if (!target) return false;
+  if (target === 'unknown' || target === 'n/a' || target === 'na') return false;
+
+  const values = [
+    user.division_master,
+    user.region_master,
+    user.zone_master,
+  ].map((rel) => {
+    const name = Array.isArray(rel) ? rel[0]?.name : rel?.name;
+    return normalizeLocation(name);
+  }).filter(Boolean);
+
+  return values.some((name) =>
+    target === name ||
+    target.startsWith(`${name}_`) ||
+    target.startsWith(`${name} `) ||
+    name.startsWith(`${target}_`) ||
+    name.startsWith(`${target} `)
+  );
+}
+
+async function getEmailsForUsers(userIds, location = null) {
+  const ids = [...new Set((userIds || []).filter((id) => id != null))];
+
+  // Always fetch: (a) the resolved FCM-token users, (b) tester, AND (c) all
+  // admins/super-admins (role_id 1 or 2) who may not have an FCM token yet
+  // but must still receive alert emails.
+  let query = supabaseAdmin
+    .from('user_master')
+    .select(`
+      user_id, email, first_name, role_id,
+      zone_master!left(name),
+      division_master!left(name),
+      region_master!left(name)
+    `);
+
+  if (ids.length > 0) {
+    // Include: exact user ids from FCM list  OR  tester  OR  any admin/super-admin
+    query = query.or(`user_id.in.(${ids.join(',')}),email.eq.tester@example.com,role_id.in.(1,2)`);
+  } else {
+    // No FCM users resolved — still send to tester + admins
+    query = query.or('email.eq.tester@example.com,role_id.in.(1,2)');
+  }
+
+  const { data, error } = await query;
+  if (error) {
+    console.error('[EMAIL] Failed to fetch recipient emails:', error.message);
+    return [];
+  }
+  // Dedupe by email (admin may also appear in FCM user list)
+  const seen = new Set();
+  const unique = (data || []).filter((u) => {
+    const key = String(u.email || '').toLowerCase();
+    if (!key.includes('@') || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return unique.filter((u) => userMatchesLocation(u, location));
+}
+
+function buildAlertHtml(title, body, type) {
+  const safe = (v) =>
+    String(v == null ? '' : v)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  return `
+    <div style="font-family:Arial,sans-serif;font-size:14px;color:#222;">
+      <p style="display:inline-block;background:#c62828;color:#fff;border-radius:4px;padding:2px 8px;font-size:12px;">
+        ${safe(type)}
+      </p>
+      <h2 style="margin:12px 0 6px;">${safe(title)}</h2>
+      <p style="margin:0 0 16px;">${safe(body)}</p>
+      <p style="color:#777;font-size:12px;margin-top:24px;">
+        Smart Coach automated alert. Please log in to the app for full details.
+      </p>
+    </div>
+  `;
+}
+
+/**
+ * Send an alert email via Brevo to the given users, honouring the type
+ * allowlist, a per-recipient/per-type cooldown, and a daily cap so we stay
+ * within Brevo's quota.
+ */
+async function sendAlertEmails(userIds, title, body, type, options = {}) {
+  try {
+    if (!isEnabled()) {
+      console.log('[EMAIL] skip=disabled type=' + type + ' (BREVO_API_KEY/SENDER missing or EMAIL_ALERTS_ENABLED=false)');
+      return { sent: 0, skipped: 'disabled' };
+    }
+
+    const typeKey = String(type || '').toUpperCase();
+    if (!typeKey || !allowedTypes().has(typeKey)) {
+      console.log(`[EMAIL] skip=type_not_allowed type=${typeKey} allowed=${[...allowedTypes()].join(',')}`);
+      return { sent: 0, skipped: 'type_not_allowed' };
+    }
+
+    rollDay();
+    const limit = dailyLimit();
+    if (sentToday >= limit) {
+      console.log(`[EMAIL] skip=daily_limit sentToday=${sentToday} limit=${limit}`);
+      return { sent: 0, skipped: 'daily_limit' };
+    }
+
+    const recipients = await getEmailsForUsers(userIds, options.location || null);
+    console.log(`[EMAIL] type=${typeKey} location=${options.location || 'none'} candidateUserIds=${(userIds||[]).length} matchedRecipients=${recipients.length}${recipients.length > 0 ? ' to=' + recipients.map(u => u.email).join(',') : ''}`);
+    if (recipients.length === 0) return { sent: 0, skipped: 'no_recipients' };
+
+    const cooldown = cooldownMs();
+    const now = Date.now();
+    const subject = `[Smart Coach] ${title}`;
+    const html = buildAlertHtml(title, body, typeKey);
+
+    let sent = 0;
+    for (const user of recipients) {
+      if (sentToday >= limit) break;
+      const key = `${String(user.email).toLowerCase()}|${typeKey}`;
+      const msSinceLast = now - (lastSentByKey.get(key) || 0);
+      if (msSinceLast < cooldown) {
+        console.log(`[EMAIL] skip=cooldown email=${user.email} type=${typeKey} remainingMs=${cooldown - msSinceLast}`);
+        continue;
+      }
+      try {
+        await sendTransactionalEmail(user.email, subject, html);
+        lastSentByKey.set(key, now);
+        sentToday++;
+        sent++;
+        console.log(`[EMAIL] sent type=${typeKey} to=${user.email}`);
+      } catch (err) {
+        console.error(`[EMAIL] Failed to send "${typeKey}" to ${user.email}: ${err.message}`);
+      }
+    }
+    if (sent > 0) console.log(`[EMAIL] Sent ${sent} "${typeKey}" alert email(s).`);
+    return { sent };
+  } catch (err) {
+    console.error('[EMAIL] sendAlertEmails error:', err.message);
+    return { sent: 0, skipped: 'error' };
+  }
+}
+
+module.exports = {
+  isConfigured,
+  isEnabled,
+  allowedTypes,
+  sendTransactionalEmail,
+  sendAlertEmails,
+};
